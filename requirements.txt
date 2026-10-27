@@ -1,0 +1,7 @@
+numpy>=1.24.0
+matplotlib>=3.7.0
+# Scoped exceptions explicitly documented in PLAN.md:
+# scipy is ONLY used for classical solver subproblems in Algorithms 1-7
+scipy>=1.10.0
+# scikit-learn is ONLY used for loading raw Wisconsin Breast Cancer dataset in P9
+scikit-learn>=1.2.0
