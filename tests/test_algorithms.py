@@ -25,6 +25,7 @@ from moo.problems import (
     ZDT2Problem,
     PortfolioProblem,
     CantileverBeamProblem,
+    BinhKornProblem,
     WaterAllocationProblem,
     ProductionPlanningProblem,
     SupplierSelectionProblem,
@@ -151,38 +152,110 @@ def test_alg05_value_function() -> None:
 
 
 def test_alg06_goal_programming() -> None:
-    # Test on P11 Production Planning (Profit >= 2400, Units >= 600)
+    # 1. P11 Production Planning (Weighted mode: Profit >= 2400, Units >= 600)
     prob_p11 = ProductionPlanningProblem()
-    res = alg06_goal_programming.run(prob_p11, budget=500, seed=42)
+    res_w = alg06_goal_programming.run(prob_p11, budget=2000, seed=42, method="weighted")
+    assert len(res_w["X_opt"]) == 1
+    f_nat_w = res_w["F_opt_nat"][0]
+    assert math.isclose(f_nat_w[0], 2400.0, abs_tol=1.0)
+    assert math.isclose(f_nat_w[1], 500.0, abs_tol=1.0)
+    assert res_w["CV_opt"][0] <= 1e-4
+    assert res_w["achieved"][0] is True  # Profit target met
+    assert res_w["achieved"][1] is False  # Units target 600 not met (shortfall 100)
+    assert math.isclose(res_w["d_minus"][0], 0.0, abs_tol=1e-3)
+    assert math.isclose(res_w["d_minus"][1], 100.0, abs_tol=1.0)
 
-    assert len(res["X_opt"]) == 1
-    x_opt = res["X_opt"][0]
-    f_nat = res["F_opt_nat"][0]
+    # 2. P11 Preemptive mode: Priority 1 (Profit) >> Priority 2 (Units)
+    res_p = alg06_goal_programming.run(prob_p11, budget=2000, seed=42, method="preemptive", priorities=[0, 1])
+    f_nat_p = res_p["F_opt_nat"][0]
+    assert math.isclose(f_nat_p[0], 2400.0, abs_tol=1.0)
+    assert math.isclose(f_nat_p[1], 500.0, abs_tol=1.0)
+    assert res_p["CV_opt"][0] <= 1e-4
+    assert res_p["achieved"][0] is True
+    assert res_p["achieved"][1] is False
 
-    # Sanity check from assignment PDF:
-    # Profit achieves target of 2400 (shortfall = 0)
-    # Units achieves maximum 500 (shortfall = 100)
-    assert math.isclose(f_nat[0], 2400.0, abs_tol=1.0)
-    assert math.isclose(f_nat[1], 500.0, abs_tol=1.0)
-    assert res["CV_opt"][0] <= 1e-4  # Feasible
+    # 3. Achievable targets on P11: Profit >= 2000, Units >= 400
+    res_ach = alg06_goal_programming.run(
+        prob_p11,
+        targets=np.array([2000.0, 400.0]),
+        goal_types=["ge", "ge"],
+        budget=1000,
+        seed=42,
+    )
+    assert res_ach["achieved"][0] is True
+    assert res_ach["achieved"][1] is True
+    assert res_ach["CV_opt"][0] <= 1e-4
+
+    # 4. Unachievable targets on P11: Profit >= 3000, Units >= 700
+    res_unach = alg06_goal_programming.run(
+        prob_p11,
+        targets=np.array([3000.0, 700.0]),
+        goal_types=["ge", "ge"],
+        budget=1000,
+        seed=42,
+    )
+    assert res_unach["achieved"][0] is False
+    assert res_unach["achieved"][1] is False
+    assert res_unach["CV_opt"][0] <= 1e-4
+
+    # 5. Constrained minimization targets on P6 Binh-Korn: f1 <= 50, f2 <= 20
+    prob_p6 = BinhKornProblem()
+    res_p6 = alg06_goal_programming.run(
+        prob_p6,
+        targets=np.array([50.0, 20.0]),
+        goal_types=["le", "le"],
+        budget=1000,
+        seed=42,
+    )
+    assert res_p6["achieved"][0] is True
+    assert res_p6["achieved"][1] is True
+    assert res_p6["CV_opt"][0] <= 1e-4
 
 
 def test_alg07_lexicographic() -> None:
-    # Test on P11 Production Planning (Priority 1: Profit, Priority 2: Units)
+    # 1. P11 Production Planning (Priority 1: Profit, Priority 2: Units)
     prob_p11 = ProductionPlanningProblem()
-    res = alg07_lexicographic.run(prob_p11, budget=1000, seed=42, priorities=[0, 1])
+    res_p11 = alg07_lexicographic.run(prob_p11, budget=1500, seed=42, priorities=[0, 1])
+    assert len(res_p11["X_opt"]) == 1
+    x_opt_p11 = res_p11["X_opt"][0]
+    f_nat_p11 = res_p11["F_opt_nat"][0]
+    assert math.isclose(x_opt_p11[0], 300.0, abs_tol=2.0)
+    assert math.isclose(x_opt_p11[1], 200.0, abs_tol=2.0)
+    assert math.isclose(f_nat_p11[0], 2400.0, abs_tol=1.0)
+    assert math.isclose(f_nat_p11[1], 500.0, abs_tol=1.0)
+    assert res_p11["CV_opt"][0] <= 1e-4
 
-    assert len(res["X_opt"]) == 1
-    x_opt = res["X_opt"][0]
-    f_nat = res["F_opt_nat"][0]
+    # 2. P7 Water Allocation on both priority orders:
+    # Priority [0, 1]: Agriculture yield first -> expected (56.0, 24.0)
+    prob_p7 = WaterAllocationProblem()
+    res_p7_01 = alg07_lexicographic.run(prob_p7, budget=2000, seed=42, priorities=[0, 1])
+    f_p7_01 = res_p7_01["F_opt_nat"][0]
+    assert math.isclose(f_p7_01[0], 56.0, abs_tol=1.0)
+    assert math.isclose(f_p7_01[1], 24.0, abs_tol=1.0)
+    assert res_p7_01["CV_opt"][0] <= 1e-4
 
-    # Priority 1 (Profit) maximized to 2400.
-    # Tie broken by Priority 2 (Units), yielding unique solution (300, 200) where Units = 500.
-    assert math.isclose(x_opt[0], 300.0, abs_tol=2.0)
-    assert math.isclose(x_opt[1], 200.0, abs_tol=2.0)
-    assert math.isclose(f_nat[0], 2400.0, abs_tol=1.0)
-    assert math.isclose(f_nat[1], 500.0, abs_tol=1.0)
-    assert res["CV_opt"][0] <= 1e-4
+    # Priority [1, 0]: Industry output first -> expected (8.0, 96.0)
+    res_p7_10 = alg07_lexicographic.run(prob_p7, budget=2000, seed=42, priorities=[1, 0])
+    f_p7_10 = res_p7_10["F_opt_nat"][0]
+    assert math.isclose(f_p7_10[0], 8.0, abs_tol=1.0)
+    assert math.isclose(f_p7_10[1], 96.0, abs_tol=1.0)
+    assert res_p7_10["CV_opt"][0] <= 1e-4
+
+    # 3. Constrained problem P6 Binh-Korn on both priority orders:
+    # Priority [0, 1]: f1 first -> minimum is at (0, 0) giving (0, 50)
+    prob_p6 = BinhKornProblem()
+    res_p6_01 = alg07_lexicographic.run(prob_p6, budget=2000, seed=42, priorities=[0, 1])
+    f_p6_01 = res_p6_01["F_opt_nat"][0]
+    assert math.isclose(f_p6_01[0], 0.0, abs_tol=0.1)
+    assert math.isclose(f_p6_01[1], 50.0, abs_tol=0.5)
+    assert res_p6_01["CV_opt"][0] <= 1e-4
+
+    # Priority [1, 0]: f2 first -> minimum is at (5, 3) giving (136, 4)
+    res_p6_10 = alg07_lexicographic.run(prob_p6, budget=2000, seed=42, priorities=[1, 0])
+    f_p6_10 = res_p6_10["F_opt_nat"][0]
+    assert math.isclose(f_p6_10[0], 136.0, abs_tol=0.5)
+    assert math.isclose(f_p6_10[1], 4.0, abs_tol=0.1)
+    assert res_p6_10["CV_opt"][0] <= 1e-4
 
 
 def test_alg08_topsis() -> None:

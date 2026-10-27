@@ -51,9 +51,11 @@ def default_goals_for_problem(problem: Problem) -> tuple[np.ndarray, list[str], 
         weights = np.array([1.0, 1.0])
         return targets, goal_types, weights
 
-    # Generic: aspirational target at midpoint between ideal and nadir
-    targets = (problem.ideal_point + problem.nadir_point) / 2.0
-    goal_types = ["le"] * problem.n_obj
+    # Generic: aspirational target at midpoint between ideal and nadir in natural space
+    ideal_nat = problem.to_natural(problem.ideal_point)
+    nadir_nat = problem.to_natural(problem.nadir_point)
+    targets = (ideal_nat + nadir_nat) / 2.0
+    goal_types = ["ge" if d == "max" else "le" for d in problem.obj_directions]
     weights = np.ones(problem.n_obj)
     return targets, goal_types, weights
 
@@ -67,6 +69,7 @@ def initialize(
     normalized_weights: bool = False,
     method: str = "weighted",
     priorities: list[int] | None = None,
+    tolerance: float = 1e-4,
     **kwargs,
 ) -> dict:
     """Initializes Goal Programming state."""
@@ -92,6 +95,7 @@ def initialize(
         "weights": w,
         "method": method.lower(),
         "priorities": pri,
+        "tolerance": float(tolerance),
         "x_opt": None,
         "f_opt": None,
         "f_opt_nat": None,
@@ -106,8 +110,30 @@ def initialize(
     return state
 
 
-def _compute_deviations(f_nat: np.ndarray, targets: np.ndarray, goal_types: list[str]) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[bool]]:
-    """Calculates underachievement (d-), overachievement (d+), unwanted deviation, and achievement status."""
+def _compute_deviations(
+    f_nat: np.ndarray,
+    targets: np.ndarray,
+    goal_types: list[str],
+    tolerance: float = 1e-4,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[bool]]:
+    """Calculates underachievement (d-), overachievement (d+), unwanted deviation, and achievement status.
+
+    Mathematical Definition (Charnes & Cooper 1961):
+        f_m^natural(x) - d_m^+ + d_m^- = T_m,  where d_m^+, d_m^- >= 0
+        - d_m^+ = max(0, f_m^natural - T_m) (overachievement)
+        - d_m^- = max(0, T_m - f_m^natural) (underachievement)
+
+    Unwanted Deviations by Goal Type:
+        - 'ge', '>=', 'max': Goal is f_m >= T_m.
+          Unwanted deviation is underachievement d_m^-.
+          Target achieved iff d_m^- <= tolerance.
+        - 'le', '<=', 'min': Goal is f_m <= T_m.
+          Unwanted deviation is overachievement d_m^+.
+          Target achieved iff d_m^+ <= tolerance.
+        - 'eq', '==': Goal is f_m == T_m.
+          Unwanted deviation is total deviation |f_m^natural - T_m| = d_m^- + d_m^+.
+          Target achieved iff |f_m^natural - T_m| <= tolerance.
+    """
     M = len(targets)
     d_minus = np.maximum(0.0, targets - f_nat)
     d_plus = np.maximum(0.0, f_nat - targets)
@@ -116,15 +142,15 @@ def _compute_deviations(f_nat: np.ndarray, targets: np.ndarray, goal_types: list
 
     for m in range(M):
         gtype = goal_types[m].lower()
-        if gtype in ("ge", ">="):
+        if gtype in ("ge", ">=", "max"):
             dev = d_minus[m]
-            is_met = bool(dev <= 1e-4)
-        elif gtype in ("le", "<="):
+            is_met = bool(dev <= tolerance)
+        elif gtype in ("le", "<=", "min"):
             dev = d_plus[m]
-            is_met = bool(dev <= 1e-4)
+            is_met = bool(dev <= tolerance)
         else:  # equality 'eq' or '=='
             dev = d_minus[m] + d_plus[m]
-            is_met = bool(dev <= 1e-4)
+            is_met = bool(dev <= tolerance)
         unwanted[m] = dev
         achieved.append(is_met)
 
@@ -142,6 +168,7 @@ def step(state: dict, problem: Problem, max_evals: int = 500) -> dict:
     weights = state["weights"]
     gp_method = state.get("method", "weighted")
     priorities = state.get("priorities", list(range(problem.n_obj)))
+    tolerance = float(state.get("tolerance", 1e-4))
     budget = state.get("budget", 1000000)
 
     bounds = list(zip(problem.xl, problem.xu))
@@ -151,13 +178,18 @@ def step(state: dict, problem: Problem, max_evals: int = 500) -> dict:
     last_cv = [0.0]
 
     if gp_method == "preemptive":
-        # Pre-emptive (Lexicographic) Goal Programming: solve priority tiers sequentially
+        # Pre-emptive (Lexicographic) Goal Programming: solve priority tiers sequentially.
+        # Strict hierarchy: Priority 1 >> Priority 2 >> ... >> Priority M.
+        # Higher-priority goal achievements are guaranteed never to deteriorate beyond tolerance.
         x_curr = rng.uniform(problem.xl, problem.xu)
         prior_tier_optima: list[tuple[int, float]] = []
 
         for p_m in priorities:
             if state["n_evals"] + eval_count[0] >= budget:
                 break
+
+            best_tier_candidate = [x_curr.copy()]
+            best_tier_cost = [1e9]
 
             def _preemptive_obj(x: np.ndarray) -> float:
                 if state["n_evals"] + eval_count[0] >= budget:
@@ -167,12 +199,15 @@ def step(state: dict, problem: Problem, max_evals: int = 500) -> dict:
                 eval_count[0] += 1
                 f_nat = problem.to_natural(f_int)
 
-                _, _, unw, _ = _compute_deviations(f_nat, targets, goal_types)
+                _, _, unw, _ = _compute_deviations(f_nat, targets, goal_types, tolerance=tolerance)
                 tier_cost = unw[p_m]
 
                 prior_pen = 0.0
+                all_prior_satisfied = True
                 for prev_m, best_val in prior_tier_optima:
-                    viol = max(0.0, unw[prev_m] - (best_val + 1e-4))
+                    viol = max(0.0, unw[prev_m] - (best_val + tolerance))
+                    if viol > 0.0:
+                        all_prior_satisfied = False
                     prior_pen += 1e4 * viol
 
                 penalty = 1e4 * cv
@@ -180,17 +215,25 @@ def step(state: dict, problem: Problem, max_evals: int = 500) -> dict:
                 last_val[0] = cost
                 last_f[0] = f_int
                 last_cv[0] = cv
+
+                # Track best point that strictly satisfies all prior tiers and problem feasibility
+                if cv <= 1e-4 and all_prior_satisfied and tier_cost < best_tier_cost[0]:
+                    best_tier_cost[0] = tier_cost
+                    best_tier_candidate[0] = x_clamped.copy()
+
                 return cost
 
-            if budget < 30:
+            if budget < 30 or len(prior_tier_optima) > 0:
+                # Warm-start from x_curr which already satisfies prior tiers
+                max_iter_nm = min(150, max(5, (budget - state["n_evals"]) // (2 * max(1, len(priorities) - len(prior_tier_optima)))))
                 res = minimize(
                     _preemptive_obj,
                     x_curr,
                     method="Nelder-Mead",
                     bounds=bounds,
-                    options={"maxiter": max(2, (budget - state["n_evals"]) // (2 * len(priorities)))},
+                    options={"maxiter": max_iter_nm, "xatol": 1e-6, "fatol": 1e-6},
                 )
-                x_curr = res.x
+                x_stage = np.clip(res.x, problem.xl, problem.xu)
             else:
                 max_iter_de = min(25, max(3, max_evals // (25 * max(1, problem.n_var) * len(priorities))))
                 res_de = differential_evolution(
@@ -205,19 +248,41 @@ def step(state: dict, problem: Problem, max_evals: int = 500) -> dict:
                     res_de.x,
                     method="Nelder-Mead",
                     bounds=bounds,
-                    options={"maxiter": 80},
+                    options={"maxiter": 80, "xatol": 1e-6, "fatol": 1e-6},
                 )
-                x_curr = res.x
+                x_stage = np.clip(res.x, problem.xl, problem.xu)
 
             if state["n_evals"] + eval_count[0] < budget:
-                f_stage, _, _ = problem.evaluate(np.clip(x_curr, problem.xl, problem.xu))
+                f_stage, cv_stage, _ = problem.evaluate(x_stage)
                 eval_count[0] += 1
                 last_f[0] = f_stage
+                last_cv[0] = cv_stage
             else:
                 f_stage = last_f[0] if last_f[0] is not None else problem.ideal_point.copy()
+                cv_stage = last_cv[0]
 
             f_nat_stage = problem.to_natural(f_stage)
-            _, _, unw_stage, _ = _compute_deviations(f_nat_stage, targets, goal_types)
+            _, _, unw_stage, _ = _compute_deviations(f_nat_stage, targets, goal_types, tolerance=tolerance)
+
+            # Mathematical non-deterioration verification:
+            # If x_stage deteriorated any prior tier beyond tolerance or violated CV, fall back
+            deteriorated = any(
+                unw_stage[prev_m] > best_val + tolerance
+                for prev_m, best_val in prior_tier_optima
+            ) or (cv_stage > 1e-4)
+
+            if deteriorated and best_tier_candidate[0] is not None:
+                x_curr = best_tier_candidate[0].copy()
+                if state["n_evals"] + eval_count[0] < budget:
+                    f_stage, cv_stage, _ = problem.evaluate(x_curr)
+                    eval_count[0] += 1
+                    last_f[0] = f_stage
+                    last_cv[0] = cv_stage
+                    f_nat_stage = problem.to_natural(f_stage)
+                    _, _, unw_stage, _ = _compute_deviations(f_nat_stage, targets, goal_types, tolerance=tolerance)
+            else:
+                x_curr = x_stage
+
             prior_tier_optima.append((p_m, unw_stage[p_m]))
 
         x_opt = np.clip(x_curr, problem.xl, problem.xu)
@@ -231,7 +296,7 @@ def step(state: dict, problem: Problem, max_evals: int = 500) -> dict:
             eval_count[0] += 1
             f_nat = problem.to_natural(f_int)
 
-            _, _, unwanted, _ = _compute_deviations(f_nat, targets, goal_types)
+            _, _, unwanted, _ = _compute_deviations(f_nat, targets, goal_types, tolerance=tolerance)
             total_dev = np.dot(weights, unwanted)
             penalty = 1e4 * cv
             cost = float(total_dev + penalty)
@@ -247,7 +312,7 @@ def step(state: dict, problem: Problem, max_evals: int = 500) -> dict:
                 x0,
                 method="Nelder-Mead",
                 bounds=bounds,
-                options={"maxiter": max(2, budget - state["n_evals"])},
+                options={"maxiter": max(2, budget - state["n_evals"]), "xatol": 1e-6, "fatol": 1e-6},
             )
             x_opt = np.clip(res.x, problem.xl, problem.xu)
         else:
@@ -264,7 +329,7 @@ def step(state: dict, problem: Problem, max_evals: int = 500) -> dict:
                 res_de.x,
                 method="Nelder-Mead",
                 bounds=bounds,
-                options={"maxiter": 80},
+                options={"maxiter": 80, "xatol": 1e-6, "fatol": 1e-6},
             )
             x_opt = np.clip(res.x, problem.xl, problem.xu)
 
@@ -281,7 +346,7 @@ def step(state: dict, problem: Problem, max_evals: int = 500) -> dict:
         cv_opt = last_cv[0]
 
     f_opt_nat = problem.to_natural(f_opt)
-    d_minus, d_plus, unwanted, achieved = _compute_deviations(f_opt_nat, targets, goal_types)
+    d_minus, d_plus, unwanted, achieved = _compute_deviations(f_opt_nat, targets, goal_types, tolerance=tolerance)
 
     state["x_opt"] = x_opt
     state["f_opt"] = f_opt
@@ -307,6 +372,7 @@ def run(
     normalized_weights: bool = False,
     method: str = "weighted",
     priorities: list[int] | None = None,
+    tolerance: float = 1e-4,
     **kwargs,
 ) -> dict:
     """Executes the Goal Programming solve."""
@@ -319,6 +385,7 @@ def run(
         normalized_weights=normalized_weights,
         method=method,
         priorities=priorities,
+        tolerance=tolerance,
         budget=budget,
         **kwargs,
     )
