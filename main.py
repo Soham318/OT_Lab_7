@@ -80,7 +80,7 @@ def main() -> None:
 
     # Command: run_alg
     p_run = subparsers.add_parser("run_alg", help="Run a specific algorithm on a problem")
-    p_run.add_argument("--alg", type=str, required=True, help="Algorithm ID (1-13) or name (e.g. weighted_sum, npga)")
+    p_run.add_argument("--alg", type=str, required=True, help="Algorithm ID (1-37) or name (e.g. weighted_sum, nsga2, moaco, gradnorm)")
     p_run.add_argument("--prob", type=str, default="p01", help="Problem name or ID (e.g. p01, p03, p11, p14)")
     p_run.add_argument("--budget", type=int, default=1000, help="Evaluation budget")
     p_run.add_argument("--seed", type=int, default=42, help="RNG seed")
@@ -120,7 +120,7 @@ def main() -> None:
         sys.exit(0)
     else:
         print(f"Command '{args.command}' will be available in its corresponding implementation phase.")
-        print("Currently in Phase 2 (Algorithms 1-13). Available commands: 'python main.py test', 'python main.py run_alg --alg <name> --prob <name>'.")
+        print("Available commands: 'python main.py test', 'python main.py run_alg --alg <1-37> --prob <p01-p14>'.")
         sys.exit(0)
 
 

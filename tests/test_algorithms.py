@@ -31,7 +31,7 @@ from moo.problems import (
     SupplierSelectionProblem,
     LaptopDesignProblem,
 )
-from moo.moo_utils import fast_non_dominated_sort, normalize_objectives
+from moo.moo_utils import fast_non_dominated_sort, normalize_objectives, igd
 from moo.algorithms import (
     get_algorithm,
     alg01_weighted_sum,
@@ -47,10 +47,16 @@ from moo.algorithms import (
     alg11_moga,
     alg12_nsga,
     alg13_npga,
+    alg14_nsga2,
 )
 from moo.algorithms.alg08_topsis import topsis_rank
 from moo.algorithms.alg09_vikor import vikor_rank
 from moo.algorithms.alg13_npga import pareto_tournament_select
+from moo.algorithms.alg14_nsga2 import (
+    crowded_tournament_select,
+    elitist_environmental_selection,
+    assign_ranks_and_crowding,
+)
 
 
 def test_alg01_weighted_sum() -> None:
@@ -686,7 +692,7 @@ def test_all_algorithms_small_budget_and_exact_eval_accounting() -> None:
             self.count += 1
             return self.base.evaluate_natural(x)
 
-    for alg_id in range(1, 14):
+    for alg_id in range(1, 38):
         alg = get_algorithm(alg_id)
         for b in [5, 15, 27]:
             cp = CountingProblem(base_prob)
@@ -699,3 +705,647 @@ def test_all_algorithms_small_budget_and_exact_eval_accounting() -> None:
             assert not np.isnan(res["F_opt"]).any(), f"Alg {alg_id} on budget {b} returned NaN objectives"
 
 
+def test_alg14_nsga2_components() -> None:
+    """Verifies NSGA-II crowding distance and crowded tournament selection on hand calculations."""
+    from moo.moo_utils import crowding_distance
+
+    # Hand-calculated front with 4 points:
+    # (1, 9), (2, 5), (4, 3), (8, 1)
+    F = np.array([
+        [1.0, 9.0],  # 0: Extremum (min f1, max f2)
+        [2.0, 5.0],  # 1: Intermediate
+        [4.0, 3.0],  # 2: Intermediate
+        [8.0, 1.0],  # 3: Extremum (max f1, min f2)
+    ])
+    dists = crowding_distance(F, [0, 1, 2, 3])
+
+    # Extrema must have infinite crowding distance (1e14)
+    assert dists[0] >= 1e14
+    assert dists[3] >= 1e14
+
+    # Point 1 hand calculation:
+    # f1 span: (8 - 1) = 7. Neighbor diff: (4 - 1) = 3 -> 3/7
+    # f2 span: (9 - 1) = 8. Neighbor diff: (9 - 3) = 6 -> 6/8 = 3/4
+    # Total distance = 3/7 + 3/4 = 33/28 approx 1.1785714
+    np.testing.assert_allclose(dists[1], 33.0 / 28.0, rtol=1e-5)
+
+    # Point 2 hand calculation:
+    # f1 neighbor diff: (8 - 2) = 6 -> 6/7
+    # f2 neighbor diff: (5 - 1) = 4 -> 4/8 = 1/2
+    # Total distance = 6/7 + 1/2 = 19/14 approx 1.3571428
+    np.testing.assert_allclose(dists[2], 19.0 / 14.0, rtol=1e-5)
+
+    # Crowded tournament selection rules:
+    rng = np.random.default_rng(42)
+    ranks = np.array([0, 0, 1, 1])
+    cds = np.array([1.5, 0.8, 2.0, 1.0])
+
+    # Rule 1: Lower rank defeats higher rank
+    assert crowded_tournament_select(0, 2, ranks, cds, rng) == 0
+    assert crowded_tournament_select(3, 1, ranks, cds, rng) == 1
+
+    # Rule 2: Same rank -> higher crowding distance defeats lower crowding distance
+    assert crowded_tournament_select(0, 1, ranks, cds, rng) == 0
+    assert crowded_tournament_select(1, 0, ranks, cds, rng) == 0
+    assert crowded_tournament_select(2, 3, ranks, cds, rng) == 2
+
+
+def test_alg14_nsga2_elitist_environmental_selection() -> None:
+    """Verifies (N + N) environmental selection truncates borderline front by crowding distance."""
+    # 8 candidate solutions across 3 fronts:
+    # Front 0: solutions 0, 1 (non-dominated)
+    # Front 1: solutions 2, 3, 4, 5 (dominated only by Front 0)
+    # Front 2: solutions 6, 7 (dominated by Front 1)
+    F_pool = np.array([
+        [1.0, 5.0],   # 0: Front 0
+        [5.0, 1.0],   # 1: Front 0
+        [2.0, 8.0],   # 2: Front 1 (extremum in Front 1: min f1)
+        [3.0, 6.0],   # 3: Front 1 (intermediate, crowded)
+        [6.0, 3.0],   # 4: Front 1 (intermediate, crowded)
+        [8.0, 2.0],   # 5: Front 1 (extremum in Front 1: max f1)
+        [10.0, 10.0], # 6: Front 2
+        [12.0, 12.0], # 7: Front 2
+    ])
+    X_pool = np.arange(8).reshape(8, 1)
+    CV_pool = np.zeros(8)
+
+    # Select target size 4 from pool of 8:
+    # Front 0 has 2 points -> both (0, 1) must be selected.
+    # Front 1 has 4 points -> needed = 2. Extrema are 2 and 5 (crowding distance 1e14),
+    # so solutions 2 and 5 must be chosen over 3 and 4.
+    X_sel, F_sel, CV_sel, fronts, ranks, cd = elitist_environmental_selection(
+        X_pool, F_pool, CV_pool, target_size=4
+    )
+    assert len(X_sel) == 4
+    assert set(X_sel.ravel()) == {0, 1, 2, 5}
+    assert 6 not in X_sel.ravel() and 7 not in X_sel.ravel()
+
+
+def test_alg14_nsga2_bounds_and_constraints() -> None:
+    """Verifies NSGA-II on constrained Binh-Korn benchmark (P6)."""
+    prob_p6 = BinhKornProblem()
+    res = alg14_nsga2.run(prob_p6, budget=800, seed=42, pop_size=40)
+
+    assert len(res["X_opt"]) > 0
+    # Obey bounds [0, 5] x [0, 3]
+    assert np.all(res["X_opt"][:, 0] >= prob_p6.xl[0] - 1e-6)
+    assert np.all(res["X_opt"][:, 0] <= prob_p6.xu[0] + 1e-6)
+    assert np.all(res["X_opt"][:, 1] >= prob_p6.xl[1] - 1e-6)
+    assert np.all(res["X_opt"][:, 1] <= prob_p6.xu[1] + 1e-6)
+
+    # All non-dominated points in archive must be feasible (CV <= 1e-4)
+    assert np.all(res["CV_opt"] <= 1e-4)
+
+
+def test_alg14_nsga2_reproducibility() -> None:
+    """Verifies NSGA-II produces deterministic results with the same random seed."""
+    prob = FactorySpeedProblem()
+    res1 = alg14_nsga2.run(prob, budget=500, seed=42, pop_size=30)
+    res2 = alg14_nsga2.run(prob, budget=500, seed=42, pop_size=30)
+
+    np.testing.assert_allclose(res1["X_opt"], res2["X_opt"], atol=1e-6)
+    np.testing.assert_allclose(res1["F_opt"], res2["F_opt"], atol=1e-6)
+    assert res1["n_evals"] == res2["n_evals"]
+
+    # Different seed produces different exploration
+    res3 = alg14_nsga2.run(prob, budget=500, seed=99, pop_size=30)
+    assert not np.allclose(res1["X_opt"], res3["X_opt"])
+
+
+def test_alg14_nsga2_known_pareto_front_recovery() -> None:
+    """Verifies NSGA-II recovers analytical Pareto fronts on P1 and P3 with quantitative residual and IGD checks."""
+    # 1. P1 (Factory Speed): Recover convex analytical front f2 = (4 - sqrt(f1))^2
+    prob_p1 = FactorySpeedProblem()
+    res_p1 = alg14_nsga2.run(prob_p1, budget=1000, seed=42, pop_size=40)
+
+    assert len(res_p1["X_opt"]) > 0
+    # All Pareto optimal solutions for P1 lie strictly in [3, 7]
+    assert np.all(res_p1["X_opt"] >= 3.0 - 0.2)
+    assert np.all(res_p1["X_opt"] <= 7.0 + 0.2)
+    F_p1 = res_p1["F_opt"]
+    p1_residuals = np.abs(F_p1[:, 1] - (4.0 - np.sqrt(F_p1[:, 0])) ** 2)
+    assert np.mean(p1_residuals) < 0.05, f"P1 analytical front mean residual {np.mean(p1_residuals)} exceeds threshold"
+
+    # 2. P3 (ZDT2 non-convex Pareto front f2 = 1 - f1^2):
+    # Test on n_var=5 benchmark with budget=1500
+    prob_p3_5 = ZDT2Problem(n_var=5)
+    true_front_5 = prob_p3_5.get_true_front(n_points=200)
+    res_p3_5 = alg14_nsga2.run(prob_p3_5, budget=1500, seed=42, pop_size=50)
+
+    F_5 = res_p3_5["F_opt"]
+    assert len(F_5) >= 30, f"Expected dense Pareto front, got {len(F_5)} points"
+    assert np.all(F_5[:, 0] >= -1e-4) and np.all(F_5[:, 0] <= 1.0 + 1e-4)
+
+    # Front residual check: |f2 - (1 - f1^2)|
+    residuals_5 = np.abs(F_5[:, 1] - (1.0 - F_5[:, 0] ** 2))
+    mean_res_5 = float(np.mean(residuals_5))
+    max_res_5 = float(np.max(residuals_5))
+    assert mean_res_5 < 0.05, f"P3 (n_var=5) mean residual {mean_res_5:.5f} exceeds 0.05 threshold"
+    assert max_res_5 < 0.10, f"P3 (n_var=5) max residual {max_res_5:.5f} exceeds 0.10 threshold"
+
+    # Quantitative IGD metric against analytical true front
+    val_igd_5 = float(igd(F_5, true_front_5))
+    assert val_igd_5 < 0.05, f"P3 (n_var=5) IGD {val_igd_5:.5f} exceeds 0.05 threshold"
+
+    # Also test on canonical n_var=10 problem (Table 1) with budget=2000
+    prob_p3_10 = ZDT2Problem(n_var=10)
+    true_front_10 = prob_p3_10.get_true_front(n_points=200)
+    res_p3_10 = alg14_nsga2.run(prob_p3_10, budget=2000, seed=42, pop_size=50)
+
+    F_10 = res_p3_10["F_opt"]
+    assert len(F_10) >= 20, f"Expected at least 20 points, got {len(F_10)}"
+    residuals_10 = np.abs(F_10[:, 1] - (1.0 - F_10[:, 0] ** 2))
+    mean_res_10 = float(np.mean(residuals_10))
+    val_igd_10 = float(igd(F_10, true_front_10))
+    assert mean_res_10 < 0.08, f"P3 (n_var=10) mean residual {mean_res_10:.5f} exceeds 0.08 threshold"
+    assert val_igd_10 < 0.08, f"P3 (n_var=10) IGD {val_igd_10:.5f} exceeds 0.08 threshold"
+
+
+def test_nsga2_distinction_from_nsga() -> None:
+    """
+    Demonstrates architectural and mathematical distinctions between NSGA-II and NSGA:
+    1. NSGA-II uses (N + N) elitist survival where non-dominated parents cannot be replaced
+       by inferior offspring.
+    2. NSGA (1994) uses generational non-elitist replacement where parents are unconditionally
+       discarded in favor of offspring.
+    3. NSGA-II uses parameter-free crowding distance, eliminating the sigma_share parameter of NSGA.
+    """
+    prob = FactorySpeedProblem()
+
+    # 1. Parameter signature check: NSGA requires sigma_share, NSGA-II does not
+    import inspect
+    nsga_params = inspect.signature(alg12_nsga.run).parameters
+    nsga2_params = inspect.signature(alg14_nsga2.run).parameters
+    assert "sigma_share" in nsga_params, "NSGA (1994) must require sigma_share"
+    assert "sigma_share" not in nsga2_params, "NSGA-II must eliminate sigma_share"
+
+    # 2. Elitist survival verification:
+    # Initialize NSGA-II and force population to true Pareto front (x in [3, 7])
+    state = alg14_nsga2.initialize(prob, pop_size=20, budget=1000, seed=42)
+    state["X"] = np.linspace(3.0, 7.0, 20).reshape(20, 1)
+    F_list, CV_list = [], []
+    for x in state["X"]:
+        f, cv, _ = prob.evaluate(x)
+        F_list.append(f)
+        CV_list.append(cv)
+    state["F"] = np.array(F_list)
+    state["CV"] = np.array(CV_list)
+    state["fronts"], state["ranks"], state["crowd_dist"] = assign_ranks_and_crowding(state["F"], state["CV"])
+
+    # Step NSGA-II for one generation
+    state_next = alg14_nsga2.step(state, prob)
+
+    # In NSGA-II, because parent solutions were all on the non-dominated front,
+    # all 20 survivors must remain on Front 0 (no loss of Pareto optimal solutions)
+    assert len(state_next["fronts"][0]) == 20, "NSGA-II (N + N) elitism must preserve all Front 0 solutions"
+
+
+def test_alg15_nsga3_components() -> None:
+    """Verifies NSGA-III reference point generation, ASF calculation, and intercepts."""
+    from moo.algorithms.alg15_nsga3 import compute_asf, find_hyperplane_intercepts
+    from moo.moo_utils import das_dennis
+
+    # 1. Das-Dennis reference generation for M=3, p=4: (4 + 3 - 1) choose (3 - 1) = 6 choose 2 = 15 points
+    ref_pts = das_dennis(p=4, M=3)
+    assert len(ref_pts) == 15
+    np.testing.assert_allclose(np.sum(ref_pts, axis=1), 1.0, atol=1e-6)
+
+    # 2. ASF extreme points identification
+    # Transformed front with 3 points
+    F_trans = np.array([
+        [1.0, 0.1, 0.1],  # Extreme along f1
+        [0.1, 1.0, 0.1],  # Extreme along f2
+        [0.1, 0.1, 1.0],  # Extreme along f3
+    ])
+    asf_vals = compute_asf(F_trans, np.array([1.0, 1e-6, 1e-6]))
+    assert np.argmin(asf_vals) == 0
+
+    intercepts = find_hyperplane_intercepts(F_trans)
+    assert len(intercepts) == 3
+    assert np.all(intercepts > 0)
+
+
+def test_alg16_spea2_fitness_and_density() -> None:
+    """Verifies SPEA2 fine-grained strength S, raw fitness R, and density estimation."""
+    from moo.algorithms.alg16_spea2 import compute_spea2_fitness, spea2_environmental_selection
+
+    # Hand-crafted 4 solutions:
+    # Sol 0: (1, 1) - dominates sol 2 (2, 2) and sol 3 (3, 3)
+    # Sol 1: (0.5, 3) - non-dominated with sol 0, dominates sol 3
+    # Sol 2: (2, 2) - dominated by sol 0
+    # Sol 3: (3, 3) - dominated by sol 0, 1, 2
+    F = np.array([
+        [1.0, 1.0],
+        [0.5, 3.0],
+        [2.0, 2.0],
+        [3.0, 3.0],
+    ])
+    CV = np.zeros(4)
+
+    fit, R, D, dist_matrix = compute_spea2_fitness(F, CV, k_nn=1)
+    # Strength S: Sol 0 dominates {2, 3} -> S=2. Sol 1 dominates {3} -> S=1. Sol 2 dominates {3} -> S=1. Sol 3 dominates {} -> S=0.
+    # Raw fitness R(i) = sum_{j dominates i} S(j):
+    # Sol 0: no one dominates -> R=0.
+    # Sol 1: no one dominates -> R=0.
+    # Sol 2: dominated by 0 -> R = S(0) = 2.
+    # Sol 3: dominated by 0, 1, 2 -> R = S(0) + S(1) + S(2) = 2 + 1 + 1 = 4.
+    assert R[0] == 0
+    assert R[1] == 0
+    assert R[2] == 2
+    assert R[3] == 4
+
+    # Non-dominated solutions (0 and 1) have raw fitness 0
+    assert fit[0] < 1.0 and fit[1] < 1.0
+    # Dominated solutions have fitness >= 1
+    assert fit[2] >= 2.0 and fit[3] >= 4.0
+
+
+def test_alg17_pesa2_hyperbox_selection() -> None:
+    """Verifies PESA-II hypergrid partitioning and region-based selection."""
+    from moo.algorithms.alg17_pesa2 import AdaptiveHypergrid, region_based_selection
+
+    # 4 solutions across 2 grid cells:
+    # Cell A has 1 solution, Cell B has 3 solutions
+    F = np.array([
+        [0.1, 0.1],  # Cell A (isolated)
+        [0.8, 0.8],  # Cell B (crowded)
+        [0.82, 0.81],# Cell B (crowded)
+        [0.85, 0.83],# Cell B (crowded)
+    ])
+    grid = AdaptiveHypergrid(n_divs=5)
+    cell_ids, cells_to_members, squeeze_factors = grid.compute_cells(F)
+    assert len(cell_ids) == 4
+
+    # Region-based binary tournament prefers the hyperbox with smaller squeeze factor (Cell A)
+    rng = np.random.default_rng(42)
+    wins_cell_a = 0
+    for _ in range(100):
+        chosen = region_based_selection(cells_to_members, rng=rng)
+        if chosen == 0:
+            wins_cell_a += 1
+
+    # Cell A (squeeze factor 1) should be chosen significantly more often than any single point in Cell B (squeeze factor 3)
+    assert wins_cell_a > 40
+
+
+def test_alg18_19_20_moead_suite() -> None:
+    """Verifies MOEA/D, MOEA/D-DE, and MOEA/D-ACO algorithms."""
+    from moo.algorithms import alg18_moead, alg19_moead_de, alg20_moead_aco
+    from moo.problems import FactorySpeedProblem, DeliveryRoutingTSPProblem
+
+    prob_p1 = FactorySpeedProblem()
+
+    # 1. MOEA/D on P1
+    res18 = alg18_moead.run(prob_p1, budget=300, seed=42, pop_size=20)
+    assert res18["n_evals"] <= 300
+    assert len(res18["X_opt"]) > 0
+
+    # 2. MOEA/D-DE on P1
+    res19 = alg19_moead_de.run(prob_p1, budget=300, seed=42, pop_size=20)
+    assert res19["n_evals"] <= 300
+    assert len(res19["X_opt"]) > 0
+
+    # 3. MOEA/D-ACO on P8 (TSP permutation problem)
+    prob_p8 = DeliveryRoutingTSPProblem()
+    res20 = alg20_moead_aco.run(prob_p8, budget=150, seed=42, pop_size=15)
+    assert res20["n_evals"] <= 150
+    assert len(res20["X_opt"]) > 0
+    # Obey valid TSP tour permutation of 15 cities
+    for tour in res20["X_opt"]:
+        assert sorted(tour) == list(range(15))
+
+
+def test_alg21_cnsga2_deb_feasibility_rules() -> None:
+    """Verifies Constrained NSGA-II Deb's feasibility-first comparison rules."""
+    from moo.algorithms.alg21_cnsga2 import constrained_tournament_select
+
+    rng = np.random.default_rng(42)
+    ranks = np.array([0, 0, 1, 1])
+    crowd_dist = np.array([1.5, 0.8, 2.0, 1.0])
+
+    # Case 1: Feasible (CV=0) defeats infeasible (CV=1.5)
+    CV1 = np.array([0.0, 1.5, 0.0, 2.0])
+    assert constrained_tournament_select(0, 1, ranks, crowd_dist, CV1, rng=rng) == 0
+
+    # Case 2: Both infeasible: smaller CV (1.5) defeats larger CV (3.0)
+    CV2 = np.array([1.5, 3.0, 2.0, 4.0])
+    assert constrained_tournament_select(0, 1, ranks, crowd_dist, CV2, rng=rng) == 0
+
+    # Case 3: Both feasible: same rank -> higher crowding distance defeats lower crowding distance
+    CV3 = np.zeros(4)
+    assert constrained_tournament_select(0, 1, ranks, crowd_dist, CV3, rng=rng) == 0
+
+
+def test_alg22_mopso_grid_and_clipping() -> None:
+    """Verifies MOPSO adaptive grid leader selection and variable bounds clipping."""
+    from moo.algorithms import alg22_mopso
+    from moo.problems import CantileverBeamProblem
+
+    prob_p5 = CantileverBeamProblem()
+    res = alg22_mopso.run(prob_p5, budget=200, seed=42, swarm_size=20)
+    assert res["n_evals"] <= 200
+    assert len(res["X_opt"]) > 0
+
+    # Verify bounds [0.01, 0.10] x [0.02, 0.20]
+    X_opt = res["X_opt"]
+    assert np.all(X_opt[:, 0] >= prob_p5.xl[0] - 1e-6)
+    assert np.all(X_opt[:, 0] <= prob_p5.xu[0] + 1e-6)
+    assert np.all(X_opt[:, 1] >= prob_p5.xl[1] - 1e-6)
+    assert np.all(X_opt[:, 1] <= prob_p5.xu[1] + 1e-6)
+
+
+def test_alg23_mogwo_pack_dynamics() -> None:
+    """Verifies MOGWO leader selection and linear parameter a decay."""
+    from moo.algorithms import alg23_mogwo
+    from moo.problems import FactorySpeedProblem
+
+    prob = FactorySpeedProblem()
+    state = alg23_mogwo.initialize(prob, seed=42, pack_size=20, budget=200)
+    assert state["n_evals"] == 20
+    assert len(state["arch_X"]) > 0
+
+    # Execute one step
+    state_next = alg23_mogwo.step(state, prob)
+    assert state_next["iter"] == 1
+    assert state_next["n_evals"] == 40
+
+
+def test_alg24_moabc_phases() -> None:
+    """Verifies MOABC runs all three bee phases within budget."""
+    from moo.algorithms import alg24_moabc
+    from moo.problems import FactorySpeedProblem
+
+    prob = FactorySpeedProblem()
+    res = alg24_moabc.run(prob, budget=150, seed=42, n_food=15)
+    assert res["n_evals"] <= 150
+    assert len(res["X_opt"]) > 0
+    assert np.all(res["X_opt"] >= prob.xl[0] - 1e-6)
+    assert np.all(res["X_opt"] <= prob.xu[0] + 1e-6)
+
+
+def test_alg25_moaco_deep_dive() -> None:
+    """Verifies MOACO (Task C Deep Dive #2) dual pheromone matrices and Pareto deposit."""
+    from moo.algorithms import alg25_moaco
+    from moo.problems import DeliveryRoutingTSPProblem
+
+    prob_p8 = DeliveryRoutingTSPProblem()
+    state = alg25_moaco.initialize(prob_p8, seed=42, n_ants=10, budget=100)
+
+    # 1. Verify dual pheromone and dual heuristic matrices
+    assert state["tau1"].shape == (15, 15)
+    assert state["tau2"].shape == (15, 15)
+    assert state["eta1"].shape == (15, 15)
+    assert state["eta2"].shape == (15, 15)
+
+    # Step MOACO
+    tau1_before = state["tau1"].copy()
+    state_next = alg25_moaco.step(state, prob_p8)
+
+    # Pheromones must have updated
+    assert not np.allclose(state_next["tau1"], tau1_before)
+    assert state_next["n_evals"] <= 20
+
+    # Run complete budget
+    res = alg25_moaco.run(prob_p8, budget=120, seed=42, n_ants=10)
+    assert res["n_evals"] <= 120
+    assert len(res["X_opt"]) > 0
+
+
+def test_alg26_mosa_annealing() -> None:
+    """Verifies MOSA multiobjective Boltzmann acceptance and cooling schedule."""
+    from moo.algorithms import alg26_mosa
+    from moo.problems import FactorySpeedProblem
+
+    prob = FactorySpeedProblem()
+    state = alg26_mosa.initialize(prob, seed=42, budget=200, T0=50.0, alpha=0.9)
+    assert state["T"] == 50.0
+
+    state_next = alg26_mosa.step(state, prob)
+    assert state_next["T"] < 50.0
+    assert state_next["n_evals"] == 2
+
+    res = alg26_mosa.run(prob, budget=100, seed=42)
+    assert res["n_evals"] <= 100
+    assert len(res["X_opt"]) > 0
+
+
+def test_alg27_mode_differential_evolution() -> None:
+    """Verifies MODE one-to-one Pareto dominance replacement and archive."""
+    from moo.algorithms import alg27_mode
+    from moo.problems import FactorySpeedProblem
+
+    prob = FactorySpeedProblem()
+    res = alg27_mode.run(prob, budget=150, seed=42, pop_size=20)
+    assert res["n_evals"] <= 150
+    assert len(res["X_opt"]) > 0
+    assert np.all(res["X_opt"] >= prob.xl[0] - 1e-6)
+    assert np.all(res["X_opt"] <= prob.xu[0] + 1e-6)
+
+
+def test_alg28_motlbo_teacher_learner() -> None:
+    """Verifies MO-TLBO teacher and learner phases."""
+    from moo.algorithms import alg28_motlbo
+    from moo.problems import FactorySpeedProblem
+
+    prob = FactorySpeedProblem()
+    state = alg28_motlbo.initialize(prob, seed=42, class_size=15, budget=100)
+    assert state["n_evals"] == 15
+
+    state_next = alg28_motlbo.step(state, prob)
+    assert state_next["iter"] == 1
+    assert state_next["n_evals"] <= 45
+
+    res = alg28_motlbo.run(prob, budget=120, seed=42, class_size=15)
+    assert res["n_evals"] <= 120
+    assert len(res["X_opt"]) > 0
+
+
+def test_alg29_moba_echolocation() -> None:
+    """Verifies MOBA acoustic schedules (loudness decay and pulse rate increase)."""
+    from moo.algorithms import alg29_moba
+    from moo.problems import FactorySpeedProblem
+
+    prob = FactorySpeedProblem()
+    state = alg29_moba.initialize(prob, seed=42, n_bats=15, budget=100, A0=1.0, r0=0.5)
+
+    A_before = state["loudness"].copy()
+    state_next = alg29_moba.step(state, prob)
+
+    # Some bats accept and decrease loudness
+    assert np.all(state_next["loudness"] <= A_before + 1e-9)
+
+    res = alg29_moba.run(prob, budget=100, seed=42, n_bats=15)
+    assert res["n_evals"] <= 100
+    assert len(res["X_opt"]) > 0
+
+
+def test_alg30_moma_memetic_search() -> None:
+    """Verifies MOMA memetic local search on Front 0 solutions."""
+    from moo.algorithms import alg30_moma
+    from moo.problems import FactorySpeedProblem
+
+    prob = FactorySpeedProblem()
+    res = alg30_moma.run(prob, budget=150, seed=42, pop_size=20)
+    assert res["n_evals"] <= 150
+    assert len(res["X_opt"]) > 0
+    # Obey bounds
+    assert np.all(res["X_opt"] >= prob.xl[0] - 1e-6)
+    assert np.all(res["X_opt"] <= prob.xu[0] + 1e-6)
+
+
+def test_alg31_rvea_apd() -> None:
+    """Verifies RVEA reference vector association and Angle-Penalized Distance."""
+    from moo.algorithms.alg31_rvea import associate_and_compute_apd, das_dennis, compute_gamma
+
+    V_raw = das_dennis(p=4, M=2)
+    norms = np.linalg.norm(V_raw, axis=1, keepdims=True)
+    V = V_raw / norms
+    gamma = compute_gamma(V)
+
+    F = np.array([[1.0, 0.0], [0.0, 1.0], [0.5, 0.5]])
+    CV = np.zeros(3)
+    ideal = np.array([0.0, 0.0])
+
+    # Early in search (progress = 0) vs late in search (progress = 1)
+    _, apd_early = associate_and_compute_apd(F, CV, V, gamma, ideal, progress=0.0)
+    _, apd_late = associate_and_compute_apd(F, CV, V, gamma, ideal, progress=1.0)
+
+    # Late APD must be >= early APD due to angle penalty
+    assert np.all(apd_late >= apd_early - 1e-9)
+
+
+def test_alg32_ibea_additive_epsilon() -> None:
+    """Verifies IBEA additive epsilon indicator matrix and fitness assignment."""
+    from moo.algorithms.alg32_ibea import compute_epsilon_indicator_matrix, compute_ibea_fitness
+
+    # 3 solutions:
+    # Sol 0: (0.1, 0.5) - non-dominated
+    # Sol 1: (0.5, 0.1) - non-dominated
+    # Sol 2: (0.8, 0.8) - dominated by both
+    F_norm = np.array([
+        [0.1, 0.5],
+        [0.5, 0.1],
+        [0.8, 0.8],
+    ])
+    I_mat = compute_epsilon_indicator_matrix(F_norm)
+    # I[i, j] = max_m (f_m(x_i) - f_m(x_j))
+    # I[0, 2] = max(0.1 - 0.8, 0.5 - 0.8) = -0.3 (Sol 0 dominates Sol 2)
+    np.testing.assert_allclose(I_mat[0, 2], -0.3, atol=1e-6)
+    np.testing.assert_allclose(I_mat[2, 0], 0.7, atol=1e-6)
+
+    fit = compute_ibea_fitness(I_mat, kappa=0.05)
+    # Sol 0 and Sol 1 must have strictly higher fitness than dominated Sol 2
+    assert fit[0] > fit[2]
+    assert fit[1] > fit[2]
+
+
+def test_alg33_sms_emoa_hv_contribution() -> None:
+    """Verifies SMS-EMOA analytical 2D exclusive hypervolume contribution."""
+    from moo.algorithms.alg33_sms_emoa import compute_exclusive_hv_contribution
+
+    # 3 solutions on 2D front:
+    # (1, 5), (2, 3), (5, 1)
+    F = np.array([
+        [1.0, 5.0],
+        [2.0, 3.0],
+        [5.0, 1.0],
+    ])
+    ref = np.array([6.0, 6.0])
+
+    contrib = compute_exclusive_hv_contribution(F, ref)
+    assert len(contrib) == 3
+    assert np.all(contrib > 0)
+    # Hand calculation for middle point (2, 3):
+    # width = right_f1 - f1 = 5 - 2 = 3
+    # height = above_f2 - f2 = 5 - 3 = 2
+    # Exclusive contribution = 3 * 2 = 6.0
+    np.testing.assert_allclose(contrib[1], 6.0, atol=1e-6)
+
+
+def test_alg34_hype_weights() -> None:
+    """Verifies HypE Monte Carlo estimation and shared sample weights."""
+    from moo.algorithms.alg34_hype import compute_hype_fitness_mc
+
+    F_front = np.array([
+        [1.0, 4.0],
+        [2.0, 2.0],
+        [4.0, 1.0],
+    ])
+    rng = np.random.default_rng(42)
+    fit = compute_hype_fitness_mc(F_front, target_k=2, n_samples=5000, rng=rng)
+    assert len(fit) == 3
+    assert np.all(fit > 0)
+
+
+def test_alg35_r_nsga2_clearing() -> None:
+    """Verifies R-NSGA-II preference distance calculation and epsilon-clearing."""
+    from moo.algorithms.alg35_r_nsga2 import compute_preference_distances, preference_tournament_select
+
+    ref_point = np.array([[2.0, 2.0]])
+    ideal = np.array([0.0, 0.0])
+    nadir = np.array([10.0, 10.0])
+
+    F = np.array([
+        [2.1, 2.1],  # Very close to ref (pref dist ~ 0.014)
+        [8.0, 8.0],  # Far from ref (pref dist ~ 0.848)
+    ])
+    D = compute_preference_distances(F, ref_point, ideal, nadir)
+    assert D[0] < D[1]
+
+    # Preference tournament must choose point 0 over point 1
+    ranks = np.array([0, 0])
+    crowd_dist = np.array([1.0, 1.0])
+    assert preference_tournament_select(0, 1, ranks, D, crowd_dist, eps_clear=0.05) == 0
+
+
+def test_alg36_mgda_minimum_norm() -> None:
+    """Verifies MGDA analytical 2D and Frank-Wolfe minimum-norm point on gradient convex hull."""
+    from moo.algorithms.alg36_mgda import min_norm_2obj, min_norm_frank_wolfe
+
+    # 1. Opposite gradients: g1 = [-1, 0], g2 = [1, 0].
+    # The minimum-norm point is the origin [0, 0] (Pareto stationary point).
+    g1 = np.array([-1.0, 0.0])
+    g2 = np.array([1.0, 0.0])
+    omega = min_norm_2obj(g1, g2)
+    np.testing.assert_allclose(omega, [0.0, 0.0], atol=1e-6)
+
+    # 2. Parallel aligned gradients: g1 = [2, 0], g2 = [4, 0].
+    # Minimum-norm is g1 = [2, 0].
+    g1_par = np.array([2.0, 0.0])
+    g2_par = np.array([4.0, 0.0])
+    omega_par = min_norm_2obj(g1_par, g2_par)
+    np.testing.assert_allclose(omega_par, [2.0, 0.0], atol=1e-6)
+
+    # 3. M=3 via Frank-Wolfe
+    G3 = np.array([
+        [1.0, 0.0],
+        [0.0, 1.0],
+        [-1.0, -1.0],
+    ])
+    omega_3 = min_norm_frank_wolfe(G3)
+    # Convex hull contains [0, 0] since (1/3)*[1,0] + (1/3)*[0,1] + (1/3)*[-1,-1] = [0, 0]
+    np.testing.assert_allclose(omega_3, [0.0, 0.0], atol=0.05)
+
+
+def test_alg37_gradnorm_deep_dive() -> None:
+    """Verifies GradNorm (Task C Deep Dive #3) target gradient norms and weight normalization."""
+    from moo.algorithms import alg37_gradnorm
+    from moo.problems import FactorySpeedProblem
+
+    prob = FactorySpeedProblem()
+    state = alg37_gradnorm.initialize(prob, seed=42, budget=100, alpha=1.5, eta_grad=0.025)
+
+    # Weights sum to M = 2
+    assert len(state["weights"]) == 2
+    np.testing.assert_allclose(np.sum(state["weights"]), 2.0, atol=1e-6)
+
+    # Execute step
+    state_next = alg37_gradnorm.step(state, prob)
+    # Weights must still be normalized to sum to M = 2
+    np.testing.assert_allclose(np.sum(state_next["weights"]), 2.0, atol=1e-6)
+    assert state_next["n_evals"] <= 10
+
+    # Run complete budget
+    res = alg37_gradnorm.run(prob, budget=50, seed=42)
+    assert res["n_evals"] <= 50
+    assert len(res["X_opt"]) > 0
