@@ -108,7 +108,7 @@ class FeatureSelectionProblem(Problem):
         return float(total_correct / self.n_samples)
 
     def evaluate(self, x: np.ndarray) -> tuple[np.ndarray, float, np.ndarray]:
-        mask = np.asarray(x, dtype=int).ravel() > 0
+        mask = (np.asarray(x, dtype=float).ravel() >= 0.5)
         n_selected = int(np.sum(mask))
 
         if n_selected == 0:

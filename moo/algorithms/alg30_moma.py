@@ -88,6 +88,8 @@ def local_search_continuous(
         x_probe[j] = np.clip(best_x[j] + delta, problem.xl[j], problem.xu[j])
         if problem.var_type == "integer":
             x_probe[j] = np.round(x_probe[j])
+        elif problem.var_type == "binary":
+            x_probe[j] = 1.0 - (1.0 if best_x[j] >= 0.5 else 0.0)
 
         f_probe, cv_probe, _ = problem.evaluate(x_probe)
         evals_used += 1
@@ -139,6 +141,56 @@ def local_search_permutation(
             best_cv = cv_cand
 
     return best_tour, best_f, best_cv, evals_used
+
+
+def local_search_binary(
+    x: np.ndarray,
+    f: np.ndarray,
+    cv: float,
+    problem: Problem,
+    weights: np.ndarray,
+    ideal_point: np.ndarray,
+    budget_rem: int,
+    rng: np.random.Generator,
+    max_steps: int = 5,
+) -> tuple[np.ndarray, np.ndarray, float, int]:
+    """
+    Local search for binary variables using valid bit flips on Tchebycheff scalar.
+    Returns (x_best, f_best, cv_best, n_evals_used).
+    """
+    n_var = len(x)
+    w = np.where(weights < 1e-12, 1e-12, weights)
+
+    def _scalar(f_vec: np.ndarray, cv_val: float) -> float:
+        if cv_val > problem.feas_tol:
+            return 1e6 + cv_val
+        return float(np.max(w * np.abs(f_vec - ideal_point)))
+
+    best_x = (np.asarray(x, dtype=float).ravel() >= 0.5).astype(float)
+    best_f = f.copy()
+    best_cv = cv
+    best_score = _scalar(best_f, best_cv)
+    evals_used = 0
+
+    flip_indices = rng.permutation(n_var)[:max_steps]
+    for j in flip_indices:
+        if evals_used >= budget_rem:
+            break
+
+        x_probe = best_x.copy()
+        x_probe[j] = 1.0 - best_x[j]  # Valid 0->1 or 1->0 bit flip
+
+        f_probe, cv_probe, _ = problem.evaluate(x_probe)
+        evals_used += 1
+
+        score_probe = _scalar(f_probe, cv_probe)
+        if score_probe < best_score:
+            best_x = x_probe
+            best_f = f_probe
+            best_cv = cv_probe
+            best_score = score_probe
+
+    return best_x, best_f, best_cv, evals_used
 
 
 def initialize(problem: Problem, seed: int = 42, **kwargs) -> dict:
@@ -276,6 +328,14 @@ def step(state: dict, problem: Problem) -> dict:
             if is_perm:
                 b_x, b_f, b_cv, evals = local_search_permutation(
                     X_new[e_idx], F_new[e_idx], CV_new[e_idx], problem, rem_budget, rng
+                )
+            elif problem.var_type == "binary":
+                diff = np.abs(F_new[e_idx] - ideal) + 1e-6
+                weights = 1.0 / diff
+                weights = weights / np.sum(weights)
+
+                b_x, b_f, b_cv, evals = local_search_binary(
+                    X_new[e_idx], F_new[e_idx], CV_new[e_idx], problem, weights, ideal, rem_budget, rng
                 )
             else:
                 # Weights inverse to distance to ideal

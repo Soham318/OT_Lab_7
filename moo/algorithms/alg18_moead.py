@@ -146,6 +146,10 @@ def step(
     feas_tol = problem.feas_tol
     is_perm = (problem.var_type == "permutation")
 
+    children_X = []
+    children_F = []
+    children_CV = []
+
     for i in range(N):
         if state["n_evals"] >= budget:
             break
@@ -185,10 +189,15 @@ def step(
                 F[j] = f_child.copy()
                 CV[j] = cv_child
 
-        # Update archive
-        combined_arch_X = np.vstack((state["archive_X"], [child]))
-        combined_arch_F = np.vstack((state["archive_F"], [f_child]))
-        combined_arch_CV = np.concatenate((state["archive_CV"], [cv_child]))
+        children_X.append(child)
+        children_F.append(f_child)
+        children_CV.append(cv_child)
+
+    # Generational update of external archive
+    if len(children_X) > 0:
+        combined_arch_X = np.vstack((state["archive_X"], children_X))
+        combined_arch_F = np.vstack((state["archive_F"], children_F))
+        combined_arch_CV = np.concatenate((state["archive_CV"], children_CV))
 
         arch_X, arch_F, arch_CV = extract_non_dominated(
             combined_arch_X, combined_arch_F, combined_arch_CV, feas_tol=feas_tol
